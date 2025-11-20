@@ -1,0 +1,273 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Abrar AI - Studio</title>
+    <style>
+        :root {
+            --primary: #4f46e5;
+            --primary-hover: #4338ca;
+            --bg: #f8fafc;
+            --card-bg: #ffffff;
+            --text: #1e293b;
+            --border: #e2e8f0;
+        }
+
+        * { box-sizing: border-box; margin: 0; padding: 0; outline: none; }
+        body { font-family: 'Inter', system-ui, sans-serif; background: var(--bg); color: var(--text); padding: 20px; }
+        .container { max-width: 1100px; margin: 0 auto; }
+
+        /* Header */
+        header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 25px; }
+        h1 { font-size: 1.8rem; font-weight: 800; color: #0f172a; }
+        
+        /* Config Panel */
+        .config-panel { background: white; padding: 20px; border-radius: 12px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); display: flex; gap: 20px; margin-bottom: 20px; border: 1px solid var(--border); }
+        .input-group { flex: 1; display: flex; flex-direction: column; gap: 6px; }
+        label { font-size: 0.8rem; font-weight: 700; text-transform: uppercase; color: #64748b; }
+        input[type="text"], input[type="file"] { padding: 10px; border: 1px solid var(--border); border-radius: 8px; width: 100%; background: #f8fafc; }
+
+        /* Drop Zone */
+        .drop-zone { 
+            border: 2px dashed #cbd5e1; border-radius: 12px; padding: 40px; text-align: center; background: white; 
+            cursor: pointer; transition: 0.2s; margin-bottom: 25px; 
+        }
+        .drop-zone:hover { border-color: var(--primary); background: #eef2ff; }
+        .drop-title { font-size: 1.1rem; font-weight: 600; color: #475569; }
+        
+        /* Grid */
+        .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 20px; }
+
+        /* Task Card */
+        .card { background: white; border-radius: 12px; border: 1px solid var(--border); overflow: hidden; box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.05); display: flex; flex-direction: column; }
+        
+        /* Image Preview Area */
+        .preview-box { height: 200px; position: relative; background: #e2e8f0; border-bottom: 1px solid var(--border); overflow: hidden; }
+        
+        /* ✅ FIX 1: Images stack properly */
+        .img-original, .img-result { 
+            width: 100%; height: 100%; object-fit: contain; 
+            position: absolute; top: 0; left: 0; 
+            transition: opacity 0.3s ease-in-out; 
+        }
+        
+        /* Original Image (Visible by default) */
+        .img-original { z-index: 1; opacity: 1; }
+
+        /* Result Image (Hidden by default, has checkerboard) */
+        .img-result { 
+            z-index: 2; opacity: 0; pointer-events: none;
+            background-color: #ffffff;
+            background-image: linear-gradient(45deg, #eee 25%, transparent 25%), linear-gradient(-45deg, #eee 25%, transparent 25%), linear-gradient(45deg, transparent 75%, #eee 75%), linear-gradient(-45deg, transparent 75%, #eee 75%);
+            background-size: 20px 20px; background-position: 0 0, 0 10px, 10px -10px, -10px 0px;
+        }
+
+        /* Card Controls */
+        .card-body { padding: 15px; display: flex; flex-direction: column; gap: 12px; flex: 1; }
+        .file-name { font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+        
+        .controls-row { display: flex; gap: 10px; }
+        select { padding: 6px; border-radius: 6px; border: 1px solid var(--border); flex: 1; }
+        
+        /* Status Bar */
+        .card-footer { padding: 12px 15px; background: #f8fafc; border-top: 1px solid var(--border); display: flex; justify-content: space-between; align-items: center; }
+        .status { font-weight: 700; font-size: 0.8rem; text-transform: uppercase; }
+        .waiting { color: #94a3b8; }
+        .processing { color: #d97706; }
+        .success { color: #16a34a; }
+        .error { color: #dc2626; }
+
+        .btn-dl { 
+            text-decoration: none; background: var(--primary); color: white; padding: 6px 14px; 
+            border-radius: 6px; font-size: 0.8rem; font-weight: 600; display: none; 
+        }
+        .btn-dl:hover { background: var(--primary-hover); }
+
+        /* Action Buttons */
+        .action-bar { display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px; }
+        .main-btn { background: var(--primary); color: white; border: none; padding: 12px 24px; border-radius: 8px; font-weight: bold; cursor: pointer; font-size: 1rem; }
+        .main-btn:hover { background: var(--primary-hover); }
+        .clear-btn { background: white; border: 1px solid #ef4444; color: #ef4444; padding: 8px 16px; border-radius: 8px; cursor: pointer; font-weight: 600; }
+        .clear-btn:hover { background: #fef2f2; }
+
+    </style>
+</head>
+<body>
+
+<div class="container">
+    <header>
+        <h1>Abrar AI Studio</h1>
+    </header>
+
+    <div class="config-panel">
+        <div class="input-group">
+            <label>API Key</label>
+            <input type="text" id="apiKey" value="your-secret-key">
+        </div>
+        <div class="input-group">
+            <label>Global Background (Optional)</label>
+            <input type="file" id="globalBgInput" accept="image/*">
+        </div>
+    </div>
+
+    <div class="drop-zone" onclick="document.getElementById('multiFileInput').click()">
+        <div class="drop-title">📂 Click to Upload Images or Videos</div>
+        <div style="color: #94a3b8; margin-top: 5px;">Select multiple files at once</div>
+        <input type="file" id="multiFileInput" multiple accept="image/*, video/*" style="display:none" onchange="handleFiles(this)">
+    </div>
+
+    <div class="action-bar">
+        <h3 id="queueCount">Queue (0)</h3>
+        <div style="display: flex; gap: 10px;">
+            <button type="button" class="clear-btn" onclick="clearAll()">Clear All</button>
+            <button type="button" class="main-btn" id="processBtn" onclick="processQueue()">Start Processing</button>
+        </div>
+    </div>
+
+    <div id="grid" class="grid"></div>
+</div>
+
+<script>
+    let queue = [];
+    const API_URL = "http://127.0.0.1:8000";
+
+    function handleFiles(input) {
+        const files = Array.from(input.files);
+        if (files.length === 0) return;
+
+        files.forEach(file => {
+            const id = Math.random().toString(36).substr(2, 9);
+            queue.push({ id, file, status: 'waiting' });
+            createCard(id, file);
+        });
+        
+        updateCount();
+        input.value = ''; 
+    }
+
+    function createCard(id, file) {
+        const card = document.createElement('div');
+        card.className = 'card';
+        card.id = id;
+        
+        const reader = new FileReader();
+        reader.onload = (e) => { card.querySelector('.img-original').src = e.target.result; };
+        reader.readAsDataURL(file);
+
+        card.innerHTML = `
+            <div class="preview-box">
+                <img class="img-original" id="orig-${id}" src="">
+                <img class="img-result" id="res-${id}" src="">
+            </div>
+            <div class="card-body">
+                <div class="file-name" title="${file.name}">${file.name}</div>
+                <div class="controls-row">
+                    <select class="mode-select">
+                        <option value="auto">Auto</option>
+                        <option value="ai">AI (Photo)</option>
+                        <option value="color_key">Logo</option>
+                    </select>
+                </div>
+                <div class="input-group">
+                    <input type="file" class="row-bg" accept="image/*" style="font-size: 0.8rem;">
+                </div>
+            </div>
+            <div class="card-footer">
+                <span class="status waiting" id="status-${id}">Ready</span>
+                <a href="#" target="_blank" class="btn-dl" id="dl-${id}">Download</a>
+            </div>
+        `;
+        document.getElementById('grid').appendChild(card);
+    }
+
+    async function processQueue() {
+        const apiKey = document.getElementById('apiKey').value;
+        const globalBg = document.getElementById('globalBgInput').files[0];
+        const processBtn = document.getElementById('processBtn');
+
+        processBtn.disabled = true;
+        processBtn.innerText = "Processing...";
+
+        for (const task of queue) {
+            if (task.status === 'done') continue;
+
+            const card = document.getElementById(task.id);
+            const statusSpan = document.getElementById(`status-${task.id}`);
+            const dlBtn = document.getElementById(`dl-${task.id}`);
+            const resultImg = document.getElementById(`res-${task.id}`);
+            const originalImg = document.getElementById(`orig-${task.id}`); // ✅ Get Original Image Element
+            
+            const mode = card.querySelector('.mode-select').value;
+            const rowBg = card.querySelector('.row-bg').files[0];
+
+            statusSpan.innerText = "Processing...";
+            statusSpan.className = "status processing";
+            
+            const formData = new FormData();
+            formData.append('files', task.file);
+            
+            if (rowBg) {
+                formData.append('bg_file', rowBg);
+            } else if (globalBg) {
+                formData.append('bg_file', globalBg);
+            }
+
+            const isVideo = task.file.type.startsWith('video');
+            const endpoint = isVideo ? '/remove-bg-video' : '/remove-bg';
+
+            try {
+                const response = await fetch(`${API_URL}${endpoint}?mode=${mode}&background_type=transparent`, {
+                    method: 'POST',
+                    headers: { 'X-API-Key': apiKey },
+                    body: formData
+                });
+
+                if (response.ok) {
+                    const data = await response.json();
+                    const finalUrl = `${API_URL}${data.results[0].url}`;
+                    
+                    statusSpan.innerText = "Done";
+                    statusSpan.className = "status success";
+                    
+                    // ✅ FIX 2: Set Source, Show Result, Hide Original
+                    resultImg.src = finalUrl;
+                    resultImg.onload = () => {
+                        resultImg.style.opacity = "1";
+                        originalImg.style.opacity = "0"; // Hide original to prevent ghosting
+                    };
+                    
+                    dlBtn.href = finalUrl;
+                    dlBtn.style.display = "block";
+                    
+                    task.status = 'done';
+                } else {
+                    const err = await response.text();
+                    console.error(err);
+                    statusSpan.innerText = "Failed";
+                    statusSpan.className = "status error";
+                }
+            } catch (e) {
+                console.error(e);
+                statusSpan.innerText = "Error";
+                statusSpan.className = "status error";
+            }
+        }
+
+        processBtn.disabled = false;
+        processBtn.innerText = "Start Processing";
+    }
+
+    function clearAll() {
+        queue = [];
+        document.getElementById('grid').innerHTML = '';
+        updateCount();
+    }
+
+    function updateCount() {
+        document.getElementById('queueCount').innerText = `Queue (${queue.length})`;
+    }
+</script>
+
+</body>
+</html>

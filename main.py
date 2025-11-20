@@ -1,457 +1,282 @@
- # main.py
-from fastapi import FastAPI, UploadFile, File, Request, Header, Depends, HTTPException, BackgroundTasks
-from fastapi.responses import JSONResponse, StreamingResponse, FileResponse
-from fastapi.staticfiles import StaticFiles
-from fastapi.middleware.cors import CORSMiddleware
-from slowapi import Limiter, _rate_limit_exceeded_handler
-from slowapi.util import get_remote_address
-from slowapi.errors import RateLimitExceeded
-from slowapi.middleware import SlowAPIMiddleware
-import torch
+# ========== Imports ==========
 import cv2
 import numpy as np
 from PIL import Image
 from io import BytesIO
 import os
-import shutil
-import tempfile
-import subprocess
-
+import re
+import logging
 import sys
 import time
-import datetime
-import filetype
-from tqdm import tqdm
-from torchvision import transforms
-from transformers import pipeline
-import threading
-import signal
 import uuid
+import threading
+from typing import List, Optional, Tuple, Union
+
+from fastapi import FastAPI, UploadFile, File, Request, Header, Depends, HTTPException, Query
+from fastapi.responses import JSONResponse, FileResponse
+from fastapi.staticfiles import StaticFiles
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.concurrency import run_in_threadpool
+from fastapi.exceptions import RequestValidationError
+from fastapi.encoders import jsonable_encoder
+
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
+from slowapi.middleware import SlowAPIMiddleware
 
 from dotenv import load_dotenv
+from rembg import remove, new_session 
 
-# Load environment variables
+# ========== Logging Configuration ==========
 load_dotenv()
+logging.basicConfig(
+    level=logging.INFO if os.getenv("DEBUG", "false").lower() != "true" else logging.DEBUG,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[logging.StreamHandler(sys.stdout)]
+)
+logger = logging.getLogger(__name__)
 
 # ========== Constants ==========
-ALLOWED_IMAGE_EXTS = {"png", "jpg", "jpeg"}
-ALLOWED_VIDEO_EXTS = {"mp4", "mov", "avi", "mkv"}
+ALLOWED_IMAGE_EXTS = {"png", "jpg", "jpeg", "webp", "bmp", "tiff"}
+ALLOWED_BG_TYPES = ["transparent", "white", "black", "green", "blue"]
+
 MAX_UPLOAD_SIZE_MB = int(os.getenv("MAX_UPLOAD_SIZE_MB", 100))
+MAX_FILES_PER_REQUEST = int(os.getenv("MAX_FILES_PER_REQUEST", 10))
 VALID_KEYS = {os.getenv("API_KEY", "your-secret-key")}
 DEBUG = os.getenv("DEBUG", "false").lower() == "true"
-RMBG_MODEL = os.getenv("RMBG_MODEL", "briaai/RMBG-1.4")
-RVM_MODEL = os.getenv("RVM_MODEL", "mobilenetv3")
-PROCESSED_DIR = os.getenv("PROCESSED_DIR", "processed")
-RATE_LIMIT_IMAGE = os.getenv("RATE_LIMIT_IMAGE", "10/minute")
-RATE_LIMIT_VIDEO = os.getenv("RATE_LIMIT_VIDEO", "5/minute")
-CLEANUP_INTERVAL_SECONDS = int(os.getenv("CLEANUP_INTERVAL_SECONDS", 3600))
-FILE_EXPIRY_SECONDS = int(os.getenv("FILE_EXPIRY_SECONDS", 86400))
-FFMPEG_CODEC = os.getenv("FFMPEG_CODEC", "libvpx-vp9")
-FFMPEG_CRF = os.getenv("FFMPEG_CRF", "30")
-FFMPEG_BV = os.getenv("FFMPEG_BV", "0")
+PROCESSED_DIR = os.path.abspath(os.getenv("PROCESSED_DIR", "processed"))
+
+# Models & Settings
+RMBG_IMAGE_MODEL = os.getenv("RMBG_IMAGE_MODEL", "isnet-general-use")
+
+# Detection Settings
+SOLID_BG_TOLERANCE = 10
+COLOR_KEY_TOLERANCE = 20 
+
+# Edge Settings (For Logo Mode)
+LOGO_EDGE_FEATHER_KERNEL_SIZE = 3
+LOGO_EDGE_FEATHER_SIGMA = 1.0
+
+# Rate Limits
+RATE_LIMIT_IMAGE = os.getenv("RATE_LIMIT_IMAGE", "20/minute")
+RATE_LIMIT_JOBS = os.getenv("RATE_LIMIT_JOBS", "60/minute")
+
+# Cleanup
+CLEANUP_INTERVAL_SECONDS = 3600
+FILE_EXPIRY_SECONDS = 86400
+
+# Global State
+jobs = {}
 
 # ========== FastAPI App ==========
-app = FastAPI(title="Abrar AI - RMBG 1.4 + RVM + NAFNet Sharpening")
+app = FastAPI(title="Abrar AI - Professional Image BG Removal")
 
-# Add CORS middleware
-allow_origins = os.getenv("ALLOWED_ORIGINS", "*").split(",")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=allow_origins,
+    allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Add rate limiting
 limiter = Limiter(key_func=get_remote_address)
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 app.add_middleware(SlowAPIMiddleware)
 
-# Mount static files for downloads
-app.mount("/processed", StaticFiles(directory=PROCESSED_DIR), name="processed")
-
-device = "cuda" if torch.cuda.is_available() else "cpu"
-print(f"🚀 Using device for PyTorch: {device}")
-
-# ========== Global Exception Handler ==========
-@app.exception_handler(Exception)
-async def global_exception_handler(request: Request, exc: Exception):
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    logger.error(f"🚨 VALIDATION ERROR: {exc.errors()}")
     return JSONResponse(
-        status_code=500,
-        content={"error": str(exc), "path": str(request.url)},
+        status_code=422,
+        content=jsonable_encoder({"detail": exc.errors(), "body": str(exc)}),
     )
 
-# ========== Request Logging Middleware ==========
-@app.middleware("http")
-async def log_requests(request: Request, call_next):
-    start = datetime.datetime.now()
-    response = await call_next(request)
-    duration = (datetime.datetime.now() - start).total_seconds()
-    if DEBUG:
-        print(f"[{datetime.datetime.now()}] {request.method} {request.url.path} -> {response.status_code} ({duration:.2f}s)")
-    return response
+os.makedirs(PROCESSED_DIR, exist_ok=True)
+app.mount("/processed", StaticFiles(directory=PROCESSED_DIR), name="processed")
 
-# ========== API Key Verification ==========
-async def verify_key(x_api_key: str = Header(...)):
-    if x_api_key not in VALID_KEYS:
-        raise HTTPException(status_code=401, detail="Invalid API key")
+# ========== Model Loading ==========
+global_image_session = None
+try:
+    logger.info(f"Loading Image Model: {RMBG_IMAGE_MODEL}...")
+    global_image_session = new_session(model_name=RMBG_IMAGE_MODEL)
+    logger.info("Image Model Loaded.")
+except Exception as e:
+    logger.error(f"Failed to load Image Model: {e}")
 
-# ========== Input Validation ==========
-def validate_upload(file: UploadFile, file_type="image"):
-    # Limit size
-    file.file.seek(0, 2)
-    size_mb = file.file.tell() / (1024 * 1024)
-    file.file.seek(0)
-    if size_mb > MAX_UPLOAD_SIZE_MB:
-        raise ValueError(f"File too large ({size_mb:.1f} MB). Max {MAX_UPLOAD_SIZE_MB} MB allowed.")
+# ========== Helpers ==========
 
-    ext = file.filename.split(".")[-1].lower()
-    if file_type == "image" and ext not in ALLOWED_IMAGE_EXTS:
-        raise ValueError("Invalid image format. Only png, jpg, jpeg supported.")
-    if file_type == "video" and ext not in ALLOWED_VIDEO_EXTS:
-        raise ValueError("Invalid video format. Only mp4, mov, avi, mkv supported.")
+def sanitize_filename(filename: str) -> str:
+    name = re.sub(r'[<>:"|?*]', '_', os.path.basename(filename))
+    return name[:250]
 
-    # Basic validation
-    if file_type == "image":
-        kind = filetype.guess(file.file.read(512))
-        file.file.seek(0)
-        if not kind or kind.extension not in ALLOWED_IMAGE_EXTS:
-            raise ValueError("File is not a valid image.")
+def ensure_safe_path(base, relative):
+    full = os.path.abspath(os.path.join(base, relative))
+    if not full.startswith(os.path.abspath(base)): raise ValueError("Path traversal")
+    return full
 
-# ========== Load RMBG Model (image) ==========
-image_model = pipeline(
-    "image-segmentation",
-    model=RMBG_MODEL,
-    trust_remote_code=True,
-    device=0 if device == "cuda" else -1
-)
+async def verify_key(x_api_key: Optional[str] = Header(None, alias="X-API-Key")):
+    if x_api_key is None or x_api_key not in VALID_KEYS:
+        raise HTTPException(status_code=401, detail="Invalid or missing API Key")
+    return x_api_key
+
+def get_bg_color_tuple(bg_type: str) -> Optional[Tuple[int, int, int]]:
+    if bg_type == "white": return (255, 255, 255)
+    if bg_type == "black": return (0, 0, 0)
+    if bg_type == "green": return (0, 177, 64)
+    if bg_type == "blue": return (0, 71, 187)
+    return None
+
+def analyze_background(img_np: np.ndarray) -> Tuple[bool, Optional[np.ndarray]]:
+    """Returns (is_solid, bg_color_rgb) based on corner analysis"""
+    try:
+        h, w, _ = img_np.shape
+        corners = [
+            img_np[0, 0], img_np[0, w-1],
+            img_np[h-1, 0], img_np[h-1, w-1]
+        ]
+        corners_np = np.array(corners)
+        mean_std = np.mean(np.std(corners_np, axis=0))
+        
+        if mean_std < SOLID_BG_TOLERANCE:
+            return True, np.mean(corners_np, axis=0).astype(np.uint8)
+        return False, None
+    except: return False, None
+
+# ========== Core Logic ==========
+
+async def process_single_image(file: UploadFile, mode: str, bg_type: str, custom_bg_pil: Optional[Image.Image] = None) -> dict:
+    try:
+        sanitized_name = sanitize_filename(file.filename)
+        file_content = await file.read()
+        
+        original_img = Image.open(BytesIO(file_content)).convert("RGB")
+        original_np = np.array(original_img)
+        
+        # 1. Determine Strategy
+        method = mode
+        is_solid_bg, detected_bg_color = analyze_background(original_np)
+        
+        if mode == "auto":
+            method = "color_key" if is_solid_bg else "ai"
+            
+        # 2. Generate Alpha Mask (0-255)
+        alpha_mask = None
+        
+        if method == "color_key":
+            # Fallback to top-left pixel if detection was ambiguous but user forced color_key
+            if detected_bg_color is None: 
+                 _, detected_bg_color = analyze_background(original_np)
+                 if detected_bg_color is None: detected_bg_color = original_np[0,0]
+
+            # Calculate Bounds
+            lower = np.array([max(0, int(c) - COLOR_KEY_TOLERANCE) for c in detected_bg_color], dtype=np.uint8)
+            upper = np.array([min(255, int(c) + COLOR_KEY_TOLERANCE) for c in detected_bg_color], dtype=np.uint8)
+            
+            # Create Mask
+            bg_mask_cv = await run_in_threadpool(cv2.inRange, original_np, lower, upper)
+            fg_mask_cv = cv2.bitwise_not(bg_mask_cv)
+            
+            # Edge Feathering
+            k_size = LOGO_EDGE_FEATHER_KERNEL_SIZE
+            if k_size % 2 == 0: k_size += 1
+            alpha_mask = await run_in_threadpool(cv2.GaussianBlur, fg_mask_cv, (k_size, k_size), LOGO_EDGE_FEATHER_SIGMA)
+            
+        else: # AI Mode
+            if global_image_session is None: raise RuntimeError("AI Model not loaded")
+            res_bytes = await run_in_threadpool(remove, file_content, session=global_image_session)
+            temp_img = Image.open(BytesIO(res_bytes)).convert("RGBA")
+            alpha_mask = np.array(temp_img)[:, :, 3]
+
+        # 3. Compositing
+        if alpha_mask.shape[:2] != original_np.shape[:2]:
+            alpha_mask = cv2.resize(alpha_mask, (original_np.shape[1], original_np.shape[0]))
+            
+        final_rgba = np.dstack((original_np, alpha_mask))
+        result_img = Image.fromarray(final_rgba, "RGBA")
+
+        # --- Background Replacement ---
+        if custom_bg_pil is not None:
+            # Resize Custom BG to match main image
+            bg_resized = custom_bg_pil.resize(result_img.size, Image.Resampling.LANCZOS).convert("RGBA")
+            result_img = Image.alpha_composite(bg_resized, result_img)
+            result_img = result_img.convert("RGB")
+            
+        elif bg_type != "transparent":
+            bg_color = get_bg_color_tuple(bg_type)
+            if bg_color:
+                bg_layer = Image.new("RGBA", result_img.size, (*bg_color, 255))
+                result_img = Image.alpha_composite(bg_layer, result_img)
+                result_img = result_img.convert("RGB")
+
+        # 4. Save
+        filename = f"{uuid.uuid4().hex}.png"
+        path = ensure_safe_path(PROCESSED_DIR, filename)
+        await run_in_threadpool(result_img.save, path, "PNG")
+        
+        return {
+            "success": True, 
+            "file": filename, 
+            "url": f"/download/image/{filename}", 
+            "mode_used": method,
+            "bg_type": "custom_image" if custom_bg_pil else bg_type
+        }
+        
+    except Exception as e:
+        logger.error(f"Img Error: {e}")
+        return {"success": False, "error": str(e)}
+
+# ========== Endpoints ==========
 
 @app.post("/remove-bg")
-@limiter.limit("10/minute")
-async def remove_bg(request: Request, file: UploadFile = File(...), _: str = Depends(verify_key)):
-    try:
-        validate_upload(file, "image")
-        image = Image.open(BytesIO(await file.read())).convert("RGB")
-        result = image_model(image)
-        arr = np.array(result)
-        # assume the segmentation output supports RGBA
-        if arr.shape[-1] == 4:
-            from PIL import ImageFilter
-            alpha = arr[:, :, 3]
-            smooth = Image.fromarray(alpha).filter(ImageFilter.GaussianBlur(1.5))
-            arr[:, :, 3] = np.array(smooth)
-        result_img = Image.fromarray(arr)
-        os.makedirs("processed", exist_ok=True)
-        filename = f"{file.filename.rsplit('.',1)[0]}_no_bg.png"
-        path = os.path.join("processed", filename)
-        result_img.save(path)
-        return {"message": "✅ Background removed!", "download_url": f"/processed/{filename}"}
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
-
-
-
-# ========== Video Background Removal (RVM) ==========
-try:
-    repo_path = os.path.join(os.path.dirname(__file__), "RobustVideoMatting")
-    if os.path.isdir(repo_path):
-        sys.path.insert(0, repo_path)
-    from RobustVideoMatting.model import MattingNetwork
-except Exception as e:
-    MattingNetwork = None
-    _rvm_import_error = e
-
-RVM_WEIGHTS = os.getenv("RVM_WEIGHTS_PATH", "models/rvm_mobilenetv3.pth")
-
-def ffmpeg_exists():
-    try:
-        subprocess.run(["ffmpeg", "-version"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        return True
-    except Exception:
-        return False
-
-@app.post("/remove-bg-video")
-@limiter.limit("5/minute")
-async def remove_bg_video(request: Request, file: UploadFile = File(...), background_type: str = "transparent", _: str = Depends(verify_key)):
-    # Remove background via RVM
-    if MattingNetwork is None:
-        return JSONResponse({"error": "RVM MattingNetwork not found.", "detail": str(_rvm_import_error)})
-    if not os.path.isfile(RVM_WEIGHTS):
-        return JSONResponse({"error": "RVM weights missing.", "fix": "Place models/rvm_mobilenetv3.pth in models folder."})
-
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tmp:
-        tmp.write(await file.read())
-        input_path = tmp.name
-
-    os.makedirs("processed", exist_ok=True)
-    base = os.path.splitext(file.filename)[0]
-    output_dir = os.path.join("processed", f"{base}_rvm")
-    os.makedirs(output_dir, exist_ok=True)
-    frames_dir = os.path.join(output_dir, "frames_rgba")
-    os.makedirs(frames_dir, exist_ok=True)
-
-    model = MattingNetwork('mobilenetv3').eval().to(device)
-    model.load_state_dict(torch.load(RVM_WEIGHTS, map_location=device))
-
-    cap = cv2.VideoCapture(input_path)
-    fps = cap.get(cv2.CAP_PROP_FPS) or 30
-    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or -1
-
-    rec = [None]*4
-    transform = transforms.ToTensor()
-
-    print(f"🎞️ Processing {total} frames at {fps} fps ({width}x{height})...")
-
-    for i in tqdm(range(total), desc="Matting"):
-        ret, frame = cap.read()
-        if not ret:
-            break
-        pil_frame = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-        src = transform(pil_frame).unsqueeze(0).to(device, torch.float32)
-
-        with torch.no_grad():
-            fgr, pha, *rec = model(src, *rec)
-
-        # Keep tensors on GPU for compositing
-        fgr = fgr[0].permute(1,2,0)  # [H, W, 3]
-        pha = pha[0,0]  # [H, W]
-
-        if background_type == "green":
-            bg = torch.tensor([0,1,0], dtype=torch.float32, device=device)
-        elif background_type == "blue":
-            bg = torch.tensor([0,0,1], dtype=torch.float32, device=device)
-        elif background_type == "white":
-            bg = torch.tensor([1,1,1], dtype=torch.float32, device=device)
-        elif background_type == "black":
-            bg = torch.tensor([0,0,0], dtype=torch.float32, device=device)
-        else:
-            bg = None
-
-        if bg is not None:
-            # Compositing on GPU
-            comp = fgr * pha.unsqueeze(-1) + bg * (1 - pha.unsqueeze(-1))
-            rgba_tensor = torch.cat([comp, pha.unsqueeze(-1)], dim=-1)  # [H, W, 4]
-        else:
-            # Transparent background
-            rgba_tensor = torch.cat([fgr * pha.unsqueeze(-1), pha.unsqueeze(-1)], dim=-1)
-
-        # Move to CPU for PIL
-        rgba_np = (rgba_tensor * 255).clamp(0, 255).byte().cpu().numpy()
-        frame_out = Image.fromarray(rgba_np, "RGBA")
-
-
-
-        out_path = os.path.join(frames_dir, f"frame_{i:06d}.png")
-        frame_out.save(out_path)
-
-    cap.release()
-
-    # Encode video
-    webm_path = os.path.join("processed", f"{base}_rvm.webm")
-
-    if not ffmpeg_exists():
-        return JSONResponse({"message": "ffmpeg missing", "frames_dir": frames_dir})
-
-    encode_cmd = ["ffmpeg","-y","-framerate", str(fps),
-                  "-i", os.path.join(frames_dir, "frame_%06d.png"),
-                  "-c:v", FFMPEG_CODEC, "-pix_fmt","yuva420p", "-crf", FFMPEG_CRF, "-b:v", FFMPEG_BV, webm_path]
-    subprocess.run(encode_cmd, check=True)
-
-    # Audio passthrough
-    audio_temp = os.path.join(output_dir, "audio.aac")
-    extract_audio = ["ffmpeg","-y","-i", input_path, "-vn", "-acodec","copy", audio_temp]
-    merge_path = os.path.join("processed", f"{base}_rvm_with_audio.webm")
-
-    try:
-        subprocess.run(extract_audio, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        merge = ["ffmpeg","-y","-i", webm_path,
-                 "-i", audio_temp, "-c:v","copy","-c:a","libopus",
-                 "-map","0:v:0","-map","1:a:0", merge_path]
-        subprocess.run(merge, check=True)
-        os.remove(webm_path)
-        webm_path = merge_path
-    except subprocess.CalledProcessError:
-        print("⚠️ Audio passthrough failed, video will be silent.")
-
-    shutil.rmtree(frames_dir)
-    os.remove(input_path)
-    if os.path.exists(audio_temp):
-        os.remove(audio_temp)
-    shutil.rmtree(output_dir)
-
-    return FileResponse(webm_path, media_type="video/webm", filename=os.path.basename(webm_path))
-
-
-
-
-
-# ========== Job Queue ==========
-jobs = {}
-
-def process_video_background_removal(job_id: str, input_path: str, background_type: str):
-    try:
-        jobs[job_id]["status"] = "processing"
-
-        os.makedirs("processed", exist_ok=True)
-        base = os.path.splitext(os.path.basename(input_path))[0]
-        output_dir = os.path.join("processed", f"{base}_rvm")
-        os.makedirs(output_dir, exist_ok=True)
-        frames_dir = os.path.join(output_dir, "frames_rgba")
-        os.makedirs(frames_dir, exist_ok=True)
-
-        model = MattingNetwork('mobilenetv3').eval().to(device)
-        model.load_state_dict(torch.load(RVM_WEIGHTS, map_location=device))
-
-        cap = cv2.VideoCapture(input_path)
-        fps = cap.get(cv2.CAP_PROP_FPS) or 30
-        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or -1
-
-        rec = [None]*4
-        transform = transforms.ToTensor()
-
-        print(f"🎞️ Processing {total} frames at {fps} fps ({width}x{height})...")
-
-        for i in tqdm(range(total), desc="Matting"):
-            ret, frame = cap.read()
-            if not ret:
-                break
-            pil_frame = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-            src = transform(pil_frame).unsqueeze(0).to(device, torch.float32)
-
-            with torch.no_grad():
-                fgr, pha, *rec = model(src, *rec)
-
-            # Keep tensors on GPU for compositing
-            fgr = fgr[0].permute(1,2,0)  # [H, W, 3]
-            pha = pha[0,0]  # [H, W]
-
-            if background_type == "green":
-                bg = torch.tensor([0,1,0], dtype=torch.float32, device=device)
-            elif background_type == "blue":
-                bg = torch.tensor([0,0,1], dtype=torch.float32, device=device)
-            elif background_type == "white":
-                bg = torch.tensor([1,1,1], dtype=torch.float32, device=device)
-            elif background_type == "black":
-                bg = torch.tensor([0,0,0], dtype=torch.float32, device=device)
-            else:
-                bg = None
-
-            if bg is not None:
-                # Compositing on GPU
-                comp = fgr * pha.unsqueeze(-1) + bg * (1 - pha.unsqueeze(-1))
-                rgba_tensor = torch.cat([comp, pha.unsqueeze(-1)], dim=-1)  # [H, W, 4]
-            else:
-                # Transparent background
-                rgba_tensor = torch.cat([fgr * pha.unsqueeze(-1), pha.unsqueeze(-1)], dim=-1)
-
-            # Move to CPU for PIL
-            rgba_np = (rgba_tensor * 255).clamp(0, 255).byte().cpu().numpy()
-            frame_out = Image.fromarray(rgba_np, "RGBA")
-
-            out_path = os.path.join(frames_dir, f"frame_{i:06d}.png")
-            frame_out.save(out_path)
-
-        cap.release()
-
-        # Encode video
-        webm_path = os.path.join("processed", f"{base}_rvm.webm")
-
-        if not ffmpeg_exists():
-            jobs[job_id] = {"status": "failed", "error": "ffmpeg missing"}
-            return
-
-        encode_cmd = ["ffmpeg","-y","-framerate", str(fps),
-                      "-i", os.path.join(frames_dir, "frame_%06d.png"),
-                      "-c:v", FFMPEG_CODEC, "-pix_fmt","yuva420p", "-crf", FFMPEG_CRF, "-b:v", FFMPEG_BV, webm_path]
-        subprocess.run(encode_cmd, check=True)
-
-        # Audio passthrough
-        audio_temp = os.path.join(output_dir, "audio.aac")
-        extract_audio = ["ffmpeg","-y","-i", input_path, "-vn", "-acodec","copy", audio_temp]
-        merge_path = os.path.join("processed", f"{base}_rvm_with_audio.webm")
-
-        try:
-            subprocess.run(extract_audio, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            merge = ["ffmpeg","-y","-i", webm_path,
-                     "-i", audio_temp, "-c:v","copy","-c:a","libopus",
-                     "-map","0:v:0","-map","1:a:0", merge_path]
-            subprocess.run(merge, check=True)
-            os.remove(webm_path)
-            webm_path = merge_path
-        except subprocess.CalledProcessError:
-            print("⚠️ Audio passthrough failed, video will be silent.")
-
-        shutil.rmtree(frames_dir)
-        os.remove(input_path)
-        if os.path.exists(audio_temp):
-            os.remove(audio_temp)
-        shutil.rmtree(output_dir)
-
-        jobs[job_id] = {"status": "completed", "result": f"/processed/{os.path.basename(webm_path)}"}
-
-    except Exception as e:
-        jobs[job_id] = {"status": "failed", "error": str(e)}
-
-@app.post("/remove-bg-video")
-@limiter.limit("5/minute")
-async def remove_bg_video(request: Request, background_tasks: BackgroundTasks, file: UploadFile = File(...), background_type: str = "transparent", _: str = Depends(verify_key)):
-    # Check for RVM availability
-    if MattingNetwork is None:
-        return JSONResponse({"error": "RVM MattingNetwork not found.", "detail": str(_rvm_import_error)})
-    if not os.path.isfile(RVM_WEIGHTS):
-        return JSONResponse({"error": "RVM weights missing.", "fix": "Place models/rvm_mobilenetv3.pth in models folder."})
-
-    try:
-        validate_upload(file, "video")
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-
-    job_id = str(uuid.uuid4())
-    jobs[job_id] = {"status": "pending"}
-
-    # Save uploaded file temporarily
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tmp:
-        tmp.write(await file.read())
-        input_path = tmp.name
-
-    background_tasks.add_task(process_video_background_removal, job_id, input_path, background_type)
-
-    return {"job_id": job_id, "status": "pending", "message": "Video background removal job submitted."}
-
-@app.get("/jobs")
-def list_jobs():
-    return {"jobs": jobs}
-
-@app.get("/jobs/{job_id}")
-def get_job_status(job_id: str):
-    if job_id not in jobs:
-        raise HTTPException(status_code=404, detail="Job not found")
-    return jobs[job_id]
-
-# ========== Auto Cleanup ==========
-def cleanup_old_files():
-    while True:
-        time.sleep(3600)  # Run every hour
-        now = time.time()
-        for root, dirs, files in os.walk("processed"):
-            for file in files:
-                file_path = os.path.join(root, file)
-                if now - os.path.getmtime(file_path) > 86400:  # 24 hours
-                    os.remove(file_path)
-
-# Start cleanup thread
-cleanup_thread = threading.Thread(target=cleanup_old_files, daemon=True)
-cleanup_thread.start()
+@limiter.limit(RATE_LIMIT_IMAGE)
+async def api_remove_image(
+    request: Request,
+    files: List[UploadFile] = File(..., description="Images to process"), 
+    bg_file: Union[UploadFile, str, None] = File(default=None, description="Custom background image"),
+    mode: str = Query("auto", enum=["auto", "ai", "color_key"], description="Processing Logic"),
+    background_type: str = Query("transparent", enum=ALLOWED_BG_TYPES, description="Solid color fallback"),
+    api_key: str = Depends(verify_key)
+):
+    if len(files) > MAX_FILES_PER_REQUEST: raise HTTPException(400, "Too many files")
+    
+    custom_bg_pil = None
+    # Smart check for optional file upload
+    if bg_file:
+        if hasattr(bg_file, "read"):
+            try:
+                content = await bg_file.read()
+                if len(content) > 0:
+                    custom_bg_pil = Image.open(BytesIO(content)).convert("RGBA")
+                    logger.info("Custom background loaded.")
+            except Exception as e:
+                logger.error(f"Failed to load custom background: {e}")
+
+    results = []
+    for i, f in enumerate(files):
+        logger.info(f"Img {i+1}/{len(files)}: {f.filename} | Mode: {mode}")
+        results.append(await process_single_image(f, mode, background_type, custom_bg_pil))
+        
+    return {"results": results}
 
 @app.get("/")
-def home():
-    return {
-        "message": "Abrar AI - RMBG 1.4 + RVM",
-        "routes": ["/remove-bg", "/remove-bg-video", "/jobs"],
-        "note": "Use /remove-bg-video for video background removal. Check /jobs for async job status."
-    }
+def home(request: Request): return {"status": "Online", "mode": "Image Only (Universal + Custom BG)"}
+
+@app.get("/jobs")
+def jobs_ep(request: Request, api_key: str = Depends(verify_key)): return {"jobs": jobs}
+
+# ========== Cleanup Task ==========
+def background_cleanup():
+    while True:
+        time.sleep(CLEANUP_INTERVAL_SECONDS)
+        now = time.time()
+        if os.path.exists(PROCESSED_DIR):
+            for f in os.listdir(PROCESSED_DIR):
+                fp = os.path.join(PROCESSED_DIR, f)
+                try:
+                    if os.path.isfile(fp) and os.stat(fp).st_mtime < now - FILE_EXPIRY_SECONDS:
+                        os.remove(fp)
+                except Exception:
+                    pass
+
+threading.Thread(target=background_cleanup, daemon=True).start()

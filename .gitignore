@@ -1,37 +1,19 @@
-# Environment variables
-.env
-
 # Python
 __pycache__/
-*.pyc
-*.pyo
-*.pyd
-.Python
-env/
+*.py[cod]
+*$py.class
 venv/
-.venv/
-pip-log.txt
-pip-delete-this-directory.txt
-.tox/
-.coverage
-.coverage.*
-.cache
-nosetests.xml
-coverage.xml
-*.cover
-*.log
-.git
-.mypy_cache
-.pytest_cache
-.hypothesis
+.env
 
-# IDE
-.vscode/
-.idea/
-
-# OS
-.DS_Store
-Thumbs.db
-
-# Processed files
+# Processed Files
 processed/
+*.png
+*.jpg
+*.jpeg
+*.webp
+
+.arranged_names.csv
+.updated_with_firstname.csv
+.updated_updated_with_firstname.csv
+
+.sm.py
