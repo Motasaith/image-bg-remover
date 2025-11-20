@@ -26,11 +26,11 @@ Standard AI models often fail on logos because they treat internal white spaces 
 
 | Original | Processed |
 | :---: | :---: |
-| ![Original Photo](demo/org1.png) | ![Processed Photo](demo/new1.png) |
+| ![Original Photo](demo/org2.jpg) | ![Processed Photo](demo/new2.png) |
 
 | Original | Processed |
 | :---: | :---: |
-| ![Original Photo](demo/org2.png) | ![Processed Photo](demo/new2.png) |
+| ![Original Photo](demo/org1.png) | ![Processed Photo](demo/new1.png) |
 
 
 ### 2. Logos & Graphics (Logo Mode)
