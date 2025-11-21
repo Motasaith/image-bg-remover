@@ -163,15 +163,3 @@ headers = {'X-API-Key': 'super-secret-key'}
 response = requests.post(url, files=files, headers=headers)
 print(response.json())
 ```
-
-### 💡 How to add the images to the README
-1.  Create a folder named `docs` inside your project.
-2.  Inside `docs`, create a folder named `images`.
-3.  Save your comparison images there with these names:
-    * `photo_original.jpg` (The monkey/woman original)
-    * `photo_result.png` (The monkey/woman result)
-    * `logo_original.png` (The blue logo original)
-    * `logo_result.png` (The blue logo transparent result)
-
-When you push this to GitHub, the images will show up beautifully in the README.
-
